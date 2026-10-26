@@ -134,6 +134,7 @@ class AethoneVpnService : VpnService() {
                 activeProtocol = activeProtocolLabel(settings),
             )
         }
+        ConnectionBus.appendLog(listOf("[app] Connection requested; preparing Aether core…"))
         startForegroundWithType(buildNotification())
 
         try {
@@ -146,10 +147,12 @@ class AethoneVpnService : VpnService() {
             // 1) the Aether core (registers on first run, scans for an endpoint)
             val standaloneProxy = settings.extraMode == ExtraMode.TOR_ONLY ||
                 settings.extraMode == ExtraMode.PSIPHON_ONLY
+            ConnectionBus.appendLog(listOf("[app] Starting Aether (${activeProtocolLabel(settings)}); endpoint scanning may take a while."))
             core.start(
                 settings,
                 firstAttempt = !standaloneProxy && !core.hasIdentity(),
             ) { onCoreDied(settings) }
+            ConnectionBus.appendLog(listOf("[app] Aether traffic is verified; preparing Android VPN tunnel…"))
 
             // Proxy Only intentionally stops here: Aether is the local SOCKS5 proxy;
             // no Android VPN interface or Zeptun native engine is started.
@@ -172,6 +175,7 @@ class AethoneVpnService : VpnService() {
             val toml = buildZeptunConfig(settings)
             val fdInt = fd.detachFd()
             tunFdInt = fdInt
+            ConnectionBus.appendLog(listOf("[app] Starting Zeptun TUN-to-SOCKS engine…"))
             val rc = Zeptun.nativeStart(this, fdInt, toml)
             if (rc != 0) {
                 val reason = when (rc) {
@@ -184,6 +188,7 @@ class AethoneVpnService : VpnService() {
                 throw AetherCore.CoreException("ZEPTUN START FAILED: $rc ($reason; ${Zeptun.nativeVersion()})")
             }
             zeptunStarted = true
+            ConnectionBus.appendLog(listOf("[app] Zeptun started successfully; monitoring traffic counters."))
 
             // 4) live!
             ConnectionBus.update {
@@ -195,6 +200,7 @@ class AethoneVpnService : VpnService() {
             notifyStatus()
             WidgetUpdater.updateAll(this)
         } catch (e: Exception) {
+            ConnectionBus.appendLog(listOf("[error] ${e.message ?: e.javaClass.simpleName}"))
             Log.e(TAG, "connect failed", e)
             fullStop()
             ConnectionBus.postError(e.message ?: "connection failed")
@@ -267,7 +273,7 @@ class AethoneVpnService : VpnService() {
     /** Zeptun engine config (TOML). Unknown keys are rejected by the engine. */
     private fun buildZeptunConfig(s: AppSettings): String = buildString {
         appendLine("preset = \"mobile\"")
-        appendLine("log_level = \"warn\"")
+        appendLine("log_level = \"info\"")
         appendLine("[tun]")
         appendLine("mtu = ${s.mtu.coerceIn(1280, 65535)}")
         appendLine("[stack]")

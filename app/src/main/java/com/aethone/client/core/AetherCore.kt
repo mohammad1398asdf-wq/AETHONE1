@@ -10,11 +10,14 @@ import com.aethone.client.data.Transport
 import java.io.File
 import java.io.IOException
 import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.Socket
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.util.concurrent.TimeUnit
 import java.util.Locale
+import okhttp3.OkHttpClient
+import okhttp3.Request
 
 /**
  * Owns the Aether core process: installs the bundled binaries, translates
@@ -358,19 +361,69 @@ class AetherCore(private val context: Context) {
         }, "aether-stdout").start()
 
         val timeout = if (firstAttempt) RUN_TIMEOUT_FIRST_MS else RUN_TIMEOUT_RETRY_MS
+        ConnectionBus.appendLog(listOf("[app] Waiting for Aether endpoint scan and real traffic validation…"))
         val deadline = System.currentTimeMillis() + timeout
+        var listenerSeen = false
+        var lastWaitingLog = 0L
         while (System.currentTimeMillis() < deadline) {
-            if (!p.isAlive) throw CoreException("core exited (code ${p.exitValue()})")
-            if (isSocksListening(s.activeProxyPort)) return
+            if (!p.isAlive) {
+                val code = runCatching { p.exitValue() }.getOrDefault(-1)
+                throw CoreException("Aether core exited before traffic was ready (code $code)")
+            }
+
+            val now = System.currentTimeMillis()
+            if (isSocksListening(s.activeProxyPort)) {
+                if (!listenerSeen) {
+                    listenerSeen = true
+                    ConnectionBus.appendLog(listOf("[app] SOCKS5 listener detected; checking that real HTTPS traffic passes through it…"))
+                }
+                if (probeProxyTraffic(s.activeProxyPort)) {
+                    ConnectionBus.appendLog(listOf("[app] End-to-end proxy check passed; Aether is ready."))
+                    return
+                }
+                if (now - lastWaitingLog >= 10_000L) {
+                    lastWaitingLog = now
+                    ConnectionBus.appendLog(listOf("[app] SOCKS5 is open, but no verified HTTPS response yet; endpoint scan/tunnel may still be in progress."))
+                }
+            } else if (now - lastWaitingLog >= 10_000L) {
+                lastWaitingLog = now
+                ConnectionBus.appendLog(listOf("[app] Waiting for local SOCKS5 listener…"))
+            }
+
             try {
                 Thread.sleep(PORT_POLL_MS)
             } catch (_: InterruptedException) {
-                throw CoreException("interrupted while waiting for the core")
+                Thread.currentThread().interrupt()
+                throw CoreException("interrupted while waiting for Aether traffic validation")
             }
         }
         stop()
-        throw CoreException("timeout: no reachable endpoint / SOCKS port never opened")
+        if (listenerSeen) {
+            throw CoreException("Aether opened SOCKS5 but real HTTPS traffic did not pass before timeout. Check the selected transport/network; connection was not marked as connected.")
+        }
+        throw CoreException("timeout: Aether did not open the SOCKS5 listener")
     }
+
+    /** Validate the data plane, not merely that a TCP port is open. */
+    private fun probeProxyTraffic(port: Int): Boolean = runCatching {
+        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port))
+        val client = OkHttpClient.Builder()
+            .proxy(proxy)
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(3, TimeUnit.SECONDS)
+            .writeTimeout(3, TimeUnit.SECONDS)
+            .callTimeout(5, TimeUnit.SECONDS)
+            .build()
+        val request = Request.Builder()
+            .url("https://www.cloudflare.com/cdn-cgi/trace")
+            .header("Cache-Control", "no-cache")
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@runCatching false
+            val body = response.body?.string().orEmpty()
+            body.lineSequence().any { it.startsWith("ip=") && it.length > 3 }
+        }
+    }.getOrDefault(false)
 
     private fun isSocksListening(port: Int): Boolean = try {
         Socket().use { s ->
